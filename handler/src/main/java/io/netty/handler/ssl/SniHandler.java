@@ -18,14 +18,23 @@ package io.netty.handler.ssl;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelOutboundHandler;
+import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.ByteToMessageDecoder;
+import io.netty.handler.codec.DecoderException;
+import io.netty.util.AsyncMapping;
 import io.netty.util.CharsetUtil;
 import io.netty.util.DomainNameMapping;
 import io.netty.util.Mapping;
+import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.FutureListener;
+import io.netty.util.concurrent.Promise;
+import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.net.IDN;
+import java.net.SocketAddress;
 import java.util.List;
 import java.util.Locale;
 
@@ -36,13 +45,15 @@ import java.util.Locale;
  * The client will send host name in the handshake data so server could decide
  * which certificate to choose for the host name. </p>
  */
-public class SniHandler extends ByteToMessageDecoder {
+public class SniHandler extends ByteToMessageDecoder implements ChannelOutboundHandler {
 
     private static final InternalLogger logger =
             InternalLoggerFactory.getInstance(SniHandler.class);
 
-    private final Mapping<Object, SslContext> mapping;
+    private final AsyncMapping<String, SslContext> mapping;
 
+    private boolean suppressRead;
+    private boolean readPending;
     private boolean handshaken;
     private volatile String hostname;
     private volatile SslContext selectedContext;
@@ -54,13 +65,8 @@ public class SniHandler extends ByteToMessageDecoder {
      * @param mapping the mapping of domain name to {@link SslContext}
      */
     @SuppressWarnings("unchecked")
-    public SniHandler(Mapping<? super String, ? extends SslContext> mapping) {
-        if (mapping == null) {
-            throw new NullPointerException("mapping");
-        }
-
-        this.mapping = (Mapping<Object, SslContext>) mapping;
-        handshaken = false;
+    public SniHandler(final Mapping<? super String, ? extends SslContext> mapping) {
+        this(new AsyncMappingAdapter(mapping));
     }
 
     /**
@@ -71,6 +77,17 @@ public class SniHandler extends ByteToMessageDecoder {
      */
     public SniHandler(DomainNameMapping<? extends SslContext> mapping) {
         this((Mapping<String, ? extends SslContext>) mapping);
+    }
+
+    /**
+     * Creates a SNI detection handler with configured {@link SslContext}
+     * maintained by {@link AsyncMapping}
+     *
+     * @param mapping the mapping of domain name to {@link SslContext}
+     */
+    @SuppressWarnings("unchecked")
+    public SniHandler(final AsyncMapping<? super String, ? extends SslContext> mapping) {
+        this.mapping = (AsyncMapping<String, SslContext>) ObjectUtil.checkNotNull(mapping, "mapping");
     }
 
     /**
@@ -88,7 +105,7 @@ public class SniHandler extends ByteToMessageDecoder {
     }
 
     @Override
-    protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+    protected void decode(final ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
         if (!handshaken && in.readableBytes() >= 5) {
             String hostname = sniHostNameFromHandshakeInfo(in);
             if (hostname != null) {
@@ -96,10 +113,36 @@ public class SniHandler extends ByteToMessageDecoder {
             }
             this.hostname = hostname;
 
-            // the mapping will return default context when this.hostname is null
-            selectedContext = mapping.map(hostname);
+            Future<SslContext> future = mapping.map(hostname, ctx.executor().<SslContext>newPromise());
+            if (future.isDone()) {
+                if (future.isSuccess()) {
+                    selectContext(ctx, future);
+                } else {
+                    throw new DecoderException(future.cause());
+                }
+            } else {
+                suppressRead = true;
+                future.addListener(new FutureListener<SslContext>() {
+                    @Override
+                    public void operationComplete(Future<SslContext> future) throws Exception {
+                        suppressRead = false;
+                        if (future.isSuccess()) {
+                            selectContext(ctx, future);
+                        } else {
+                            ctx.fireExceptionCaught(new DecoderException(future.cause()));
+                        }
+                        if (readPending) {
+                            readPending = false;
+                            ctx.read();
+                        }
+                    }
+                });
+            }
         }
+    }
 
+    private void selectContext(ChannelHandlerContext ctx, Future<SslContext> f) {
+        selectedContext = f.getNow();
         if (handshaken) {
             SslHandler sslHandler = selectedContext.newHandler(ctx.alloc());
             ctx.pipeline().replace(this, SslHandler.class.getName(), sslHandler);
@@ -191,6 +234,70 @@ public class SniHandler extends ByteToMessageDecoder {
             }
             handshaken = true;
             return null;
+        }
+    }
+
+    @Override
+    public void bind(ChannelHandlerContext ctx, SocketAddress localAddress, ChannelPromise promise) throws Exception {
+        ctx.bind(localAddress, promise);
+    }
+
+    @Override
+    public void connect(ChannelHandlerContext ctx, SocketAddress remoteAddress, SocketAddress localAddress,
+                        ChannelPromise promise) throws Exception {
+        ctx.connect(remoteAddress, localAddress, promise);
+    }
+
+    @Override
+    public void disconnect(ChannelHandlerContext ctx, ChannelPromise promise) throws Exception {
+        ctx.disconnect();
+    }
+
+    @Override
+    public void close(ChannelHandlerContext ctx, ChannelPromise promise) throws Exception {
+        ctx.close(promise);
+    }
+
+    @Override
+    public void deregister(ChannelHandlerContext ctx, ChannelPromise promise) throws Exception {
+        ctx.deregister(promise);
+    }
+
+    @Override
+    public void read(ChannelHandlerContext ctx) throws Exception {
+        if (suppressRead) {
+            readPending = true;
+        } else {
+            ctx.read();
+        }
+    }
+
+    @Override
+    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+        ctx.write(msg, promise);
+    }
+
+    @Override
+    public void flush(ChannelHandlerContext ctx) throws Exception {
+        ctx.flush();
+    }
+
+    private static final class AsyncMappingAdapter implements AsyncMapping<String, SslContext> {
+        private final Mapping<? super String, ? extends SslContext> mapping;
+
+        private AsyncMappingAdapter(Mapping<? super String, ? extends SslContext> mapping) {
+            this.mapping = ObjectUtil.checkNotNull(mapping, "mapping");
+        }
+
+        @Override
+        public Future<SslContext> map(String input, Promise<SslContext> promise) {
+            final SslContext context;
+            try {
+                context = mapping.map(input);
+            } catch (Throwable cause) {
+                return promise.setFailure(cause);
+            }
+            return promise.setSuccess(context);
         }
     }
 }
