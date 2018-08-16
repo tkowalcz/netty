@@ -45,6 +45,7 @@ public class JsonObjectDecoderTest {
         res.release();
 
         assertFalse(ch.finish());
+        // Test of push
     }
 
     @Test
